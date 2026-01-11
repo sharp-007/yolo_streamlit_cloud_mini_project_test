@@ -1,301 +1,292 @@
-import streamlit as st
-import cv2
+"""
+YOLO 实时目标检测应用
+使用 WebRTC 实现摄像头实时检测，支持在 Streamlit Cloud 部署
+参考: https://github.com/whitphx/streamlit-webrtc
+"""
 import av
+import numpy as np
+import streamlit as st
+import pandas as pd
+from PIL import Image
+from collections import Counter
+from streamlit_webrtc import webrtc_streamer, WebRtcMode
 import threading
-from ultralytics import YOLO
-from streamlit_webrtc import webrtc_streamer, VideoProcessorBase
+import time
+from turn import get_ice_servers
 
+# 页面配置
 st.set_page_config(
     page_title="YOLO 实时目标检测",
-    page_icon="🚀",
+    page_icon="🎯",
     layout="wide"
 )
 
-# -------------------------
-# 全局共享变量（线程安全）
-# -------------------------
-lock = threading.Lock()
-shared_data = {
-    "num_objects": 0,
-    "labels": [],
-    "frame_count": 0,  # 用于调试：跟踪处理的帧数
-    "last_error": None,  # 用于调试：记录最后的错误
-    "processor_initialized": False,  # 用于调试：确认 VideoProcessor 是否被创建
-    "processor_error": None  # 用于调试：记录 VideoProcessor 初始化错误
-}
 
-# -------------------------
-# 加载 YOLO（必须在全局）
-# -------------------------
 @st.cache_resource
-def load_model():
-    try:
-        return YOLO("yolov8n.pt")
-    except Exception as e:
-        st.error(f"模型加载失败: {e}")
-        return None
+def load_yolo_model(model_path: str = "yolov8n.pt"):
+    """
+    加载 YOLO 模型（使用 cache_resource 避免重复加载）
+    """
+    from ultralytics import YOLO
+    model = YOLO(model_path)
+    return model
 
-model = load_model()
 
-# 如果模型加载失败，显示错误信息
-if model is None:
-    st.error("⚠️ 无法加载YOLO模型，请检查模型文件是否存在。")
-    st.stop()
+# 全局锁和数据容器（用于线程间共享数据）
+# 参考: https://github.com/whitphx/streamlit-webrtc#pull-values-from-the-callback
+lock = threading.Lock()
+result_container = {"objects": [], "frame_count": 0}
 
-# -------------------------
-# Video Processor
-# -------------------------
-class YOLOProcessor(VideoProcessorBase):
-    def __init__(self):
-        super().__init__()
-        # 在 VideoProcessor 中加载模型（使用缓存避免重复加载）
-        try:
-            self.model = YOLO("yolov8n.pt")
-            print("YOLOProcessor 初始化成功，模型已加载")
-        except Exception as e:
-            print(f"YOLOProcessor 初始化失败: {e}")
-            self.model = None
+
+def create_video_callback(model, confidence_threshold):
+    """
+    创建视频帧回调函数
+    使用闭包传递模型和置信度参数
+    """
+    def video_frame_callback(frame: av.VideoFrame) -> av.VideoFrame:
+        # 将 VideoFrame 转换为 numpy 数组
+        image = frame.to_ndarray(format="bgr24")
         
-        # 调试：确认 VideoProcessor 被创建
+        if model is None:
+            return av.VideoFrame.from_ndarray(image, format="bgr24")
+        
+        # 使用 YOLO 进行检测
+        results = model(image, conf=confidence_threshold, verbose=False)
+        
+        # 获取检测到的对象
+        detected_objects = []
+        if len(results) > 0 and results[0].boxes is not None:
+            boxes = results[0].boxes
+            for box in boxes:
+                cls_id = int(box.cls[0])
+                class_name = model.names[cls_id]
+                confidence = float(box.conf[0])
+                detected_objects.append({
+                    "class": class_name,
+                    "confidence": confidence
+                })
+        
+        # 更新共享容器（线程安全）
         with lock:
-            shared_data["processor_initialized"] = True
-            shared_data["processor_error"] = None if self.model else "模型加载失败"
+            result_container["objects"] = detected_objects
+            result_container["frame_count"] += 1
+        
+        # 在图像上绘制检测结果
+        annotated_frame = results[0].plot()
+        
+        # 使用 PIL 处理以避免内存泄漏（参考官方文档）
+        result_image = Image.fromarray(annotated_frame)
+        output_array = np.asarray(result_image)
+        
+        return av.VideoFrame.from_ndarray(output_array, format="bgr24")
     
-    def recv(self, frame):
-        try:
-            # 检查模型是否已加载
-            if self.model is None:
-                print("警告：模型未加载，跳过检测")
-                return frame
-            
-            # 更新帧计数器（用于调试）
-            with lock:
-                shared_data["frame_count"] += 1
-                shared_data["last_error"] = None
-                # 每100帧打印一次，避免过多输出
-                if shared_data["frame_count"] % 100 == 0:
-                    print(f"已处理 {shared_data['frame_count']} 帧")
-            
-            # 转换帧为 numpy 数组
-            img = frame.to_ndarray(format="bgr24")
-            
-            # 检查图像是否有效
-            if img is None or img.size == 0:
-                return frame
-            
-            # YOLO 推理（关闭 verbose，使用更快的推理设置）
-            results = self.model(img, verbose=False, conf=0.25)[0]
-            
-            labels = []
-            
-            # 处理检测结果
-            if results.boxes is not None and len(results.boxes) > 0:
-                for box in results.boxes:
-                    try:
-                        cls_id = int(box.cls[0])
-                        label = self.model.names[cls_id]
-                        labels.append(label)
-                        
-                        # 获取边界框坐标
-                        x1, y1, x2, y2 = map(int, box.xyxy[0])
-                        
-                        # 绘制检测框
-                        cv2.rectangle(img, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                        
-                        # 绘制标签文本
-                        cv2.putText(
-                            img,
-                            label,
-                            (x1, y1 - 5),
-                            cv2.FONT_HERSHEY_SIMPLEX,
-                            0.6,
-                            (0, 255, 0),
-                            2,
-                        )
-                    except Exception:
-                        # 单个框处理失败，继续处理下一个
-                        continue
-            
-            # 写入共享数据（线程安全）
-            with lock:
-                shared_data["num_objects"] = len(labels)
-                shared_data["labels"] = labels.copy()  # 复制列表避免引用问题
-            
-            # 返回处理后的帧
-            return av.VideoFrame.from_ndarray(img, format="bgr24")
-            
-        except Exception as e:
-            # 错误处理：如果处理失败，返回原始帧并记录错误
-            import traceback
-            error_msg = f"VideoProcessor recv 错误: {e}"
-            print(error_msg)
-            print(traceback.format_exc())
-            
-            # 记录错误到共享数据
-            with lock:
-                shared_data["last_error"] = str(e)
-            
-            return frame
+    return video_frame_callback
 
-# -------------------------
-# UI
-# -------------------------
-st.title("🚀 YOLO 实时目标检测（Streamlit Cloud 可用）")
-st.markdown("---")
 
-# 添加说明信息
-with st.expander("📖 使用说明", expanded=False):
-    st.markdown("""
-    1. 点击下方的 **▶️ START** 按钮启动摄像头
-    2. 允许浏览器访问摄像头权限
-    3. 系统将实时检测画面中的目标对象
-    4. 检测结果会显示在右侧统计面板中
-    """)
-
-# 调试：显示 webrtc_streamer 配置
-st.write("🔧 调试信息：")
-st.write(f"- 模型已加载: {model is not None}")
-st.write(f"- VideoProcessor 类: {YOLOProcessor}")
-
-# 配置 RTC（用于 WebRTC 连接）
-rtc_configuration = {
-    "iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]
-}
-
-# 兼容当前安装的 streamlit-webrtc 版本（0.44.0 使用的是 video_transformer_factory）
-# 这是统计信息始终为 0 的根本原因：之前传的是 video_processor_factory，库根本没有创建 YOLOProcessor
-webrtc_ctx = webrtc_streamer(
-    key="yolo",
-    video_transformer_factory=YOLOProcessor,
-    media_stream_constraints={"video": True, "audio": False},
-    async_processing=True,
-    rtc_configuration=rtc_configuration,
-)
-
-# 显示 webrtc 状态
-st.write(f"- WebRTC 状态: {webrtc_ctx.state}")
-st.write(f"- 是否正在播放: {webrtc_ctx.state.playing}")
-
-st.markdown("---")
-
-# 创建两列布局
-col1, col2 = st.columns(2)
-
-with col1:
-    st.subheader("📊 检测统计")
-    metric_placeholder = st.empty()
-    status_placeholder = st.empty()
-
-with col2:
-    st.subheader("🏷️ 检测到的标签")
-    label_placeholder = st.empty()
-
-# -------------------------
-# 主线程 UI 更新（不依赖 playing 状态，直接读取检测数据）
-# -------------------------
-# 从共享数据中读取最新的检测结果（线程安全）
-with lock:
-    num = shared_data["num_objects"]
-    labels = shared_data["labels"].copy() if shared_data["labels"] else []
-    frame_count = shared_data.get("frame_count", 0)
-    last_error = shared_data.get("last_error", None)
-    processor_initialized = shared_data.get("processor_initialized", False)
-
-# 判断是否有视频流在处理（通过 frame_count 判断）
-has_video_stream = frame_count > 0
-
-# ========== 始终显示统计信息 ==========
-# 更新UI显示 - 对象数量
-metric_placeholder.metric("检测到的对象数量", num)
-
-# 调试信息：显示原始数据（帮助排查问题）
-with st.expander("🔍 调试信息（点击展开）", expanded=False):
-    import time
-    current_time = time.strftime("%H:%M:%S")
-    st.write(f"**更新时间**: {current_time}")
-    st.write(f"- 检测到的对象数量: {num}")
-    st.write(f"- 标签列表: {labels}")
-    st.write(f"- 已处理帧数: {frame_count}")
-    st.write(f"- 是否有视频流: {has_video_stream}")
-    st.write(f"- Processor 已初始化: {processor_initialized}")
-    st.write(f"- 刷新计数器: {st.session_state.get('refresh_counter', 0)}")
-    if last_error:
-        st.write(f"- 最后错误: {last_error}")
+def render_detection_statistics(objects):
+    """
+    渲染检测统计图表
+    """
+    if not objects:
+        st.info("📊 等待检测结果... 请确保摄像头已开启并有物体被检测到")
+        return
     
-    # 显示 shared_data 的原始内容（用于调试）
-    st.write("**shared_data 原始内容:**")
-    st.json({
-        "num_objects": shared_data.get("num_objects", 0),
-        "labels": shared_data.get("labels", []),
-        "frame_count": shared_data.get("frame_count", 0),
-        "last_error": shared_data.get("last_error", None),
-        "processor_initialized": shared_data.get("processor_initialized", False)
-    })
+    # 统计各类别数量
+    class_names = [obj["class"] for obj in objects]
+    class_counts = Counter(class_names)
+    
+    # 统计各类别平均置信度
+    class_confidences = {}
+    for obj in objects:
+        class_name = obj["class"]
+        if class_name not in class_confidences:
+            class_confidences[class_name] = []
+        class_confidences[class_name].append(obj["confidence"])
+    
+    avg_confidences = {
+        cls: sum(confs) / len(confs) 
+        for cls, confs in class_confidences.items()
+    }
+    
+    # 显示统计信息
+    st.success(f"✅ 检测到 **{len(objects)}** 个对象，共 **{len(class_counts)}** 个类别")
+    
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        st.markdown("##### 📊 各类别数量")
+        if class_counts:
+            df_counts = pd.DataFrame({
+                "类别": list(class_counts.keys()),
+                "数量": list(class_counts.values())
+            })
+            st.bar_chart(df_counts.set_index("类别"))
+    
+    with col2:
+        st.markdown("##### 📈 平均置信度")
+        if avg_confidences:
+            df_conf = pd.DataFrame({
+                "类别": list(avg_confidences.keys()),
+                "置信度": [round(v, 3) for v in avg_confidences.values()]
+            })
+            st.bar_chart(df_conf.set_index("类别"))
+    
+    # 详细列表
+    st.markdown("##### 📋 检测详情")
+    if objects:
+        df_details = pd.DataFrame([
+            {"类别": obj["class"], "置信度": f"{obj['confidence']:.2%}"}
+            for obj in objects
+        ])
+        st.dataframe(df_details, use_container_width=True, height=200)
 
-# 显示视频流状态
-if has_video_stream:
-    st.success(f"✅ 视频流运行中 - 已处理 {frame_count} 帧")
-    if last_error:
-        st.error(f"⚠️ 检测到错误: {last_error}")
-else:
-    if processor_initialized:
-        st.info("⏳ VideoProcessor 已初始化，等待视频流启动...")
+
+def main():
+    """
+    主函数
+    """
+    st.title("🎯 YOLO 实时目标检测")
+    st.markdown("使用 YOLOv8 进行实时目标检测，支持摄像头实时检测和统计分析。")
+    
+    # 侧边栏配置
+    st.sidebar.header("⚙️ 设置")
+    
+    # 模型选择
+    model_option = st.sidebar.selectbox(
+        "选择模型",
+        ["yolov8n.pt"],
+        help="选择 YOLO 模型（n=nano，速度最快）"
+    )
+    
+    # 置信度阈值
+    confidence_threshold = st.sidebar.slider(
+        "置信度阈值",
+        min_value=0.1,
+        max_value=1.0,
+        value=0.5,
+        step=0.05,
+        help="只显示置信度高于此阈值的检测结果"
+    )
+    
+    # 显示 ICE 服务器状态
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("🌐 网络状态")
+    
+    ice_servers = get_ice_servers()
+    if any("turn:" in str(s.get("urls", [])) for s in ice_servers):
+        st.sidebar.success("✅ TURN 服务器已配置")
     else:
-        st.warning("⏳ VideoProcessor 尚未初始化...")
+        st.sidebar.warning("⚠️ 使用 STUN 服务器（本地测试可用）")
+    
+    # 加载模型
+    with st.spinner("正在加载 YOLO 模型..."):
+        model = load_yolo_model(model_option)
+    st.sidebar.success(f"✅ 模型已加载: {model_option}")
+    
+    # 创建回调函数
+    video_callback = create_video_callback(model, confidence_threshold)
+    
+    # 主布局
+    col_video, col_stats = st.columns([3, 2])
+    
+    with col_video:
+        st.subheader("📹 实时检测")
+        
+        # WebRTC 配置 - 使用 video_frame_callback 参数（官方推荐方式）
+        ctx = webrtc_streamer(
+            key="yolo-detection",
+            mode=WebRtcMode.SENDRECV,
+            video_frame_callback=video_callback,
+            rtc_configuration={"iceServers": ice_servers},
+            media_stream_constraints={
+                "video": {
+                    "width": {"ideal": 640},
+                    "height": {"ideal": 480}
+                },
+                "audio": False
+            },
+            async_processing=True,
+        )
+    
+    with col_stats:
+        st.subheader("📊 实时统计")
+        
+        # 创建占位符用于动态更新
+        status_placeholder = st.empty()
+        stats_placeholder = st.empty()
+        
+        # 当视频正在播放时，使用循环持续更新统计
+        # 参考: https://github.com/whitphx/streamlit-webrtc#pull-values-from-the-callback
+        if ctx.state.playing:
+            status_placeholder.success("🟢 摄像头已连接，正在检测...")
+            
+            # 使用循环持续更新统计信息
+            while ctx.state.playing:
+                with lock:
+                    objects = result_container["objects"].copy()
+                    frame_count = result_container["frame_count"]
+                
+                with stats_placeholder.container():
+                    if frame_count > 0:
+                        st.caption(f"已处理 {frame_count} 帧")
+                    render_detection_statistics(objects)
+                
+                # 短暂休眠，避免过于频繁的更新
+                time.sleep(0.5)
+        else:
+            status_placeholder.info("👆 点击 'START' 按钮开启摄像头")
+            
+            # 显示当前统计（如果有历史数据）
+            with lock:
+                objects = result_container["objects"].copy()
+                frame_count = result_container["frame_count"]
+            
+            with stats_placeholder.container():
+                if frame_count > 0:
+                    st.caption(f"已处理 {frame_count} 帧")
+                    render_detection_statistics(objects)
+                else:
+                    st.info("📊 请先开启摄像头")
+    
+    # 使用说明
+    with st.expander("📖 使用说明", expanded=False):
+        st.markdown("""
+        ### 如何使用
+        1. **点击 START 按钮** 开启摄像头
+        2. **允许浏览器访问摄像头** 权限
+        3. **等待连接建立** 可能需要几秒钟
+        4. **查看检测结果** 实时显示在视频上
+        5. **统计图表会自动更新**
+        
+        ### 设置说明
+        - **置信度阈值**: 调整检测敏感度，越高越严格
+        - **模型选择**: YOLOv8n 是最快的版本
+        
+        ### 注意事项
+        - 首次使用需要下载模型文件
+        - 需要稳定的网络连接
+        - 建议使用 Chrome/Edge 浏览器
+        """)
+    
+    # 部署信息
+    with st.expander("🚀 部署信息", expanded=False):
+        st.markdown("""
+        ### Streamlit Cloud 部署
+        
+        如需在 Streamlit Cloud 上部署，请设置以下环境变量：
+        - `TWILIO_ACCOUNT_SID`: Twilio Account SID
+        - `TWILIO_AUTH_TOKEN`: Twilio Auth Token
+        
+        ### 获取 Twilio 凭证
+        1. 访问 [Twilio Console](https://www.twilio.com/)
+        2. 注册/登录账号
+        3. 获取 Account SID 和 Auth Token
+        
+        ### 参考项目
+        - [streamlit-webrtc](https://github.com/whitphx/streamlit-webrtc)
+        - [style-transfer-web-app](https://github.com/whitphx/style-transfer-web-app)
+        """)
 
-# 显示检测结果
-if num > 0:
-    status_placeholder.success("✅ 检测到目标对象")
-    label_text = "**检测到的对象：**\n\n"
-    # 显示标签列表（去重并统计数量）
-    unique_labels = list(set(labels))
-    for i, label in enumerate(unique_labels, 1):
-        count = labels.count(label)
-        label_text += f"{i}. {label} (x{count})\n"
-    label_placeholder.markdown(label_text)
-else:
-    if has_video_stream:
-        status_placeholder.info("🔍 等待检测目标...")
-        label_placeholder.write("暂无检测到对象（请确保画面中有可检测的对象，如人、手机、杯子等）")
-    else:
-        status_placeholder.info("💡 点击上方 ▶️ START 按钮启动摄像头")
-        label_placeholder.write("等待启动摄像头...")
 
-# ========== 自动刷新机制 ==========
-# 关键修复：无论初始状态如何，都要定期刷新以检查是否有新的数据
-# 使用 session_state 跟踪刷新次数和上次的 frame_count
-if "refresh_counter" not in st.session_state:
-    st.session_state.refresh_counter = 0
-if "last_frame_count" not in st.session_state:
-    st.session_state.last_frame_count = frame_count
-
-st.session_state.refresh_counter += 1
-
-# 检查 frame_count 是否有变化（说明 recv 在工作）
-frame_count_changed = frame_count != st.session_state.last_frame_count
-if frame_count_changed:
-    st.session_state.last_frame_count = frame_count
-
-# 根据是否有视频流决定刷新频率
-if has_video_stream:
-    # 有视频流时，每3秒刷新一次（更频繁）
-    refresh_interval = 6  # 约3秒
-    status_msg = f"💡 自动刷新中... 当前检测到 {num} 个对象，已处理 {frame_count} 帧"
-else:
-    # 没有视频流时，每5秒检查一次
-    refresh_interval = 10  # 约5秒
-    status_msg = "💡 定期检查中... 等待视频流启动"
-
-# 定期刷新页面以更新统计信息
-if st.session_state.refresh_counter >= refresh_interval:
-    st.session_state.refresh_counter = 0
-    st.rerun()
-
-# 添加手动刷新按钮
-col_refresh = st.columns([1, 1, 1])
-with col_refresh[1]:
-    if st.button("🔄 立即刷新统计", key="refresh_stats_btn"):
-        st.rerun()
-
-# 显示状态提示
-st.caption(status_msg)
+if __name__ == "__main__":
+    main()

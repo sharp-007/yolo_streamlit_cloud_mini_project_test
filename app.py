@@ -12,6 +12,7 @@ from collections import Counter
 from streamlit_webrtc import webrtc_streamer, WebRtcMode
 import threading
 import time
+from datetime import datetime
 from turn import get_ice_servers
 
 # 页面配置
@@ -20,6 +21,17 @@ st.set_page_config(
     page_icon="🎯",
     layout="wide"
 )
+
+# 初始化 session_state（用于持久化保存检测结果）
+if "detection_history" not in st.session_state:
+    st.session_state.detection_history = {
+        "current_objects": [],       # 当前帧检测结果
+        "all_detections": [],        # 所有检测结果累计
+        "frame_count": 0,            # 处理帧数
+        "start_time": None,          # 开始时间
+        "end_time": None,            # 结束时间
+        "class_counts": Counter(),   # 类别累计计数
+    }
 
 
 @st.cache_resource
@@ -83,47 +95,99 @@ def create_video_callback(model, confidence_threshold):
     return video_frame_callback
 
 
-def render_detection_statistics(objects):
+def render_realtime_statistics(objects, frame_count):
     """
-    渲染检测统计图表
+    渲染实时检测统计（当前帧）
     """
     if not objects:
         st.info("📊 等待检测结果... 请确保摄像头已开启并有物体被检测到")
         return
     
-    # 统计各类别数量
+    st.caption(f"🔴 实时检测中 | 已处理 {frame_count} 帧")
+    
+    # 统计当前帧各类别数量
     class_names = [obj["class"] for obj in objects]
     class_counts = Counter(class_names)
     
-    # 统计各类别平均置信度
-    class_confidences = {}
-    for obj in objects:
-        class_name = obj["class"]
-        if class_name not in class_confidences:
-            class_confidences[class_name] = []
-        class_confidences[class_name].append(obj["confidence"])
+    # 显示当前帧统计
+    st.success(f"✅ 当前帧检测到 **{len(objects)}** 个对象")
     
-    avg_confidences = {
-        cls: sum(confs) / len(confs) 
-        for cls, confs in class_confidences.items()
-    }
+    # 当前帧详情
+    if objects:
+        df_current = pd.DataFrame([
+            {"类别": obj["class"], "置信度": f"{obj['confidence']:.2%}"}
+            for obj in objects
+        ])
+        st.dataframe(df_current, use_container_width=True, height=150)
+
+
+def render_summary_statistics(history):
+    """
+    渲染检测结果汇总统计
+    """
+    all_detections = history["all_detections"]
+    frame_count = history["frame_count"]
+    class_counts = history["class_counts"]
+    start_time = history["start_time"]
+    end_time = history["end_time"]
     
-    # 显示统计信息
-    st.success(f"✅ 检测到 **{len(objects)}** 个对象，共 **{len(class_counts)}** 个类别")
+    if not all_detections:
+        st.info("📊 暂无检测结果")
+        return
     
-    col1, col2 = st.columns(2)
+    # 计算检测时长
+    if start_time and end_time:
+        duration = (end_time - start_time).total_seconds()
+        duration_str = f"{duration:.1f} 秒"
+    else:
+        duration_str = "未知"
     
+    st.caption(f"⏹️ 检测已停止（结果已汇总）")
+    
+    # 汇总统计卡片
+    st.markdown("### 📈 检测汇总")
+    
+    col1, col2, col3, col4 = st.columns(4)
     with col1:
-        st.markdown("##### 📊 各类别数量")
+        st.metric("📷 处理帧数", f"{frame_count}")
+    with col2:
+        st.metric("🎯 总检测次数", f"{len(all_detections)}")
+    with col3:
+        st.metric("📦 类别数", f"{len(class_counts)}")
+    with col4:
+        st.metric("⏱️ 检测时长", duration_str)
+    
+    st.markdown("---")
+    
+    # 类别统计图表
+    col_chart1, col_chart2 = st.columns(2)
+    
+    with col_chart1:
+        st.markdown("##### 📊 各类别检测次数")
         if class_counts:
             df_counts = pd.DataFrame({
                 "类别": list(class_counts.keys()),
-                "数量": list(class_counts.values())
+                "次数": list(class_counts.values())
             })
+            # 按次数排序
+            df_counts = df_counts.sort_values("次数", ascending=False)
             st.bar_chart(df_counts.set_index("类别"))
     
-    with col2:
-        st.markdown("##### 📈 平均置信度")
+    with col_chart2:
+        st.markdown("##### 📈 各类别平均置信度")
+        # 计算各类别平均置信度
+        class_confidences = {}
+        for det in all_detections:
+            cls = det["class"]
+            if cls not in class_confidences:
+                class_confidences[cls] = []
+            class_confidences[cls].append(det["confidence"])
+        
+        avg_confidences = {
+            cls: sum(confs) / len(confs) 
+            for cls, confs in class_confidences.items()
+        }
+        
         if avg_confidences:
             df_conf = pd.DataFrame({
                 "类别": list(avg_confidences.keys()),
@@ -131,14 +195,36 @@ def render_detection_statistics(objects):
             })
             st.bar_chart(df_conf.set_index("类别"))
     
-    # 详细列表
-    st.markdown("##### 📋 检测详情")
-    if objects:
-        df_details = pd.DataFrame([
-            {"类别": obj["class"], "置信度": f"{obj['confidence']:.2%}"}
-            for obj in objects
-        ])
-        st.dataframe(df_details, use_container_width=True, height=200)
+    # 详细统计表格
+    st.markdown("##### 📋 类别详细统计")
+    
+    # 构建详细统计数据
+    stats_data = []
+    for cls in class_counts.keys():
+        confs = [d["confidence"] for d in all_detections if d["class"] == cls]
+        stats_data.append({
+            "类别": cls,
+            "检测次数": class_counts[cls],
+            "占比": f"{class_counts[cls] / len(all_detections) * 100:.1f}%",
+            "平均置信度": f"{sum(confs) / len(confs):.2%}",
+            "最高置信度": f"{max(confs):.2%}",
+            "最低置信度": f"{min(confs):.2%}",
+        })
+    
+    df_stats = pd.DataFrame(stats_data)
+    df_stats = df_stats.sort_values("检测次数", ascending=False)
+    st.dataframe(df_stats, use_container_width=True, hide_index=True)
+    
+    # 饼图显示类别占比
+    st.markdown("##### 🥧 类别占比分布")
+    import plotly.express as px
+    fig = px.pie(
+        values=list(class_counts.values()),
+        names=list(class_counts.keys()),
+        hole=0.4
+    )
+    fig.update_layout(height=300, margin=dict(t=20, b=20, l=20, r=20))
+    st.plotly_chart(fig, use_container_width=True)
 
 
 def main():
@@ -167,6 +253,24 @@ def main():
         step=0.05,
         help="只显示置信度高于此阈值的检测结果"
     )
+    
+    # 清除历史按钮
+    st.sidebar.markdown("---")
+    if st.sidebar.button("🗑️ 清除检测历史", use_container_width=True):
+        st.session_state.detection_history = {
+            "current_objects": [],
+            "all_detections": [],
+            "frame_count": 0,
+            "start_time": None,
+            "end_time": None,
+            "class_counts": Counter(),
+        }
+        # 同时重置全局容器
+        with lock:
+            result_container["objects"] = []
+            result_container["frame_count"] = 0
+        st.sidebar.success("✅ 历史已清除")
+        st.rerun()
     
     # 显示 ICE 服务器状态
     st.sidebar.markdown("---")
@@ -209,16 +313,19 @@ def main():
         )
     
     with col_stats:
-        st.subheader("📊 实时统计")
+        st.subheader("📊 检测统计")
         
         # 创建占位符用于动态更新
         status_placeholder = st.empty()
         stats_placeholder = st.empty()
         
         # 当视频正在播放时，使用循环持续更新统计
-        # 参考: https://github.com/whitphx/streamlit-webrtc#pull-values-from-the-callback
         if ctx.state.playing:
             status_placeholder.success("🟢 摄像头已连接，正在检测...")
+            
+            # 记录开始时间
+            if st.session_state.detection_history["start_time"] is None:
+                st.session_state.detection_history["start_time"] = datetime.now()
             
             # 使用循环持续更新统计信息
             while ctx.state.playing:
@@ -226,27 +333,39 @@ def main():
                     objects = result_container["objects"].copy()
                     frame_count = result_container["frame_count"]
                 
+                # 累积保存检测结果
+                if objects:
+                    st.session_state.detection_history["current_objects"] = objects
+                    st.session_state.detection_history["frame_count"] = frame_count
+                    
+                    # 累积所有检测结果
+                    st.session_state.detection_history["all_detections"].extend(objects)
+                    
+                    # 更新类别计数
+                    for obj in objects:
+                        st.session_state.detection_history["class_counts"][obj["class"]] += 1
+                
                 with stats_placeholder.container():
-                    if frame_count > 0:
-                        st.caption(f"已处理 {frame_count} 帧")
-                    render_detection_statistics(objects)
+                    render_realtime_statistics(objects, frame_count)
                 
                 # 短暂休眠，避免过于频繁的更新
                 time.sleep(0.5)
+            
+            # 循环结束，记录结束时间
+            st.session_state.detection_history["end_time"] = datetime.now()
+            
         else:
             status_placeholder.info("👆 点击 'START' 按钮开启摄像头")
             
-            # 显示当前统计（如果有历史数据）
-            with lock:
-                objects = result_container["objects"].copy()
-                frame_count = result_container["frame_count"]
+            # 从 session_state 读取保存的历史结果
+            history = st.session_state.detection_history
             
             with stats_placeholder.container():
-                if frame_count > 0:
-                    st.caption(f"已处理 {frame_count} 帧")
-                    render_detection_statistics(objects)
+                if history["all_detections"]:
+                    # 显示汇总统计
+                    render_summary_statistics(history)
                 else:
-                    st.info("📊 请先开启摄像头")
+                    st.info("📊 请先开启摄像头进行检测")
     
     # 使用说明
     with st.expander("📖 使用说明", expanded=False):
@@ -257,10 +376,15 @@ def main():
         3. **等待连接建立** 可能需要几秒钟
         4. **查看检测结果** 实时显示在视频上
         5. **统计图表会自动更新**
+        6. **停止后显示汇总统计** 包含所有检测结果
         
-        ### 设置说明
-        - **置信度阈值**: 调整检测敏感度，越高越严格
-        - **模型选择**: YOLOv8n 是最快的版本
+        ### 统计说明
+        - **实时模式**: 显示当前帧检测结果
+        - **汇总模式**: 停止后显示完整统计，包括：
+          - 总检测次数和处理帧数
+          - 各类别检测次数和占比
+          - 平均/最高/最低置信度
+          - 类别占比饼图
         
         ### 注意事项
         - 首次使用需要下载模型文件
